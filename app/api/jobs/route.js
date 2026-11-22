@@ -1,27 +1,81 @@
 import { NextResponse } from 'next/server';
-import { admin } from '@/lib/supabaseAdmin';
-import { MAX_COPIES } from '@/lib/pricing';
+import { supabase } from '@/lib/supabaseAdmin';
+import { createPayment } from '@/lib/sslcommerz';
+import crypto from 'crypto';
 
-export async function POST(req) {
-  const { copies, color, name } = await req.json();
-  const c = Number(copies);
-  if (!Number.isInteger(c) || c < 1 || c > MAX_COPIES)
-    return NextResponse.json({ error: 'কপি সংখ্যা ঠিক নয়' }, { status: 400 });
-  if (typeof name !== 'string' || !name.toLowerCase().endsWith('.pdf'))
-    return NextResponse.json({ error: 'শুধু PDF দিন' }, { status: 400 });
+export async function POST(request, context) {
+  try {
+    const body = await request.json();
+    const { copies, color, fileName, fileUrl } = body;
 
-  const sb = admin();
-  const id = crypto.randomUUID();
-  const path = `${id}.pdf`;
+    if (!copies || Number(copies) < 1) {
+      return NextResponse.json(
+        { error: 'কপির সংখ্যা ঠিক না' },
+        { status: 400 }
+      );
+    }
 
-  const { error } = await sb.from('print_jobs').insert({
-    id, file_path: path, original_name: name.slice(0, 100),
-    copies: c, color: !!color, status: 'pending',
-  });
-  if (error) return NextResponse.json({ error: 'জব বানানো যায়নি' }, { status: 500 });
+    if (!fileName || String(fileName).trim() === '') {
+      return NextResponse.json(
+        { error: 'ফাইল সিলেক্ট করুন' },
+        { status: 400 }
+      );
+    }
 
-  const { data, error: e2 } = await sb.storage.from('pdfs').createSignedUploadUrl(path);
-  if (e2) return NextResponse.json({ error: 'আপলোড লিংক বানানো যায়নি' }, { status: 500 });
+    const id = context?.params?.id || crypto.randomUUID();
+    const token = crypto.randomBytes(4).toString('hex').toUpperCase();
+    const path = `print_jobs/${id}.pdf`;
 
-  return NextResponse.json({ id, path, token: data.token });
+    const { error: insertError } = await supabase
+      .from('print_jobs')
+      .insert({
+        id,
+        file_path: path,
+        original_name: fileName,
+        file_url: fileUrl || null,
+        copies: Number(copies),
+        color: Boolean(color),
+        status: 'pending',
+      });
+
+    if (insertError) {
+      return NextResponse.json(
+        { error: 'জব সেভ করা যায়নি' },
+        { status: 500 }
+      );
+    }
+
+    const { data, error: urlError } = await supabase
+      .from('print_jobs')
+      .select('id, token')
+      .eq('id', id)
+      .single();
+
+    if (urlError) {
+      return NextResponse.json(
+        { error: 'পেমেন্ট লিংক তৈরি করা যায়নি' },
+        { status: 500 }
+      );
+    }
+
+    const paymentResponse = await createPayment({
+      jobId: id,
+      token: data?.token || token,
+      copies: Number(copies),
+      color: Boolean(color),
+      fileName,
+    });
+
+    return NextResponse.json({
+      id,
+      path,
+      token: data?.token || token,
+      payment: paymentResponse,
+    });
+  } catch (err) {
+    return NextResponse.json(
+      { error: 'সার্ভার এরর হয়েছে' },
+      { status: 500 }
+    );
+  }
 }
